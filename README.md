@@ -1,7 +1,28 @@
-# 侧车：QQ 插件的「解析 / 看视频」外部服务（参考实现）
+﻿# 侧车：QQ 插件的「解析 / 看视频」外部服务
 
 > **这不是子插件，不要拷进 `plugins/`。** 它是要在**另一个进程**里跑的小 HTTP 服务：
-> `node sidecar/server.mjs`（零 npm 依赖，Node 22+ 即可）。
+> `node server.mjs`（零 npm 依赖，Node 22+ 即可）。
+
+## 配合哪个插件用
+
+| 插件 | 在本仓库对应 | 说明 |
+|---|---|---|
+| `plugins/link-parser` | `POST /parse` | 主仓库已内置。装了侧车它才有用（不装就一直走"链接交给模型"的降级路径） |
+| `plugins/video-read` | `POST /read` | 主仓库 PR #1。群里直接发的视频文件 → 抽帧给模型看 |
+| `plugins/video-link-read` | `POST /read` | 主仓库 PR #1。B 站/抖音链接 → 下载抽帧给模型看 |
+
+**装了侧车不代表插件就有**：上面三个插件是插件，本仓库是它们的"外部执行器"。
+
+## 快速验证
+
+```bash
+node server.mjs
+# 另开一个窗口
+curl http://127.0.0.1:3972/health
+```
+
+看到 `{"ok":true,"ffmpeg":true,"ytdlp":true,...}` 就是好了。
+`ffmpeg:false` 说明没找到 ffmpeg —— 启动日志里会说要怎么办。
 
 ## 它是干什么的
 
