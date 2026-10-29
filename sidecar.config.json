@@ -26,7 +26,12 @@
                          "bili2233.cn",
                          "douyin.com",
                          "iesdouyin.com",
-                         "v.douyin.com"
+                         "v.douyin.com",
+                         "qq.com",
+                         "gtimg.com",
+                         "qianp.com",
+                         "myqcloud.com",
+                         "nt.qq.com.cn"
                      ],
     "reuseMinutes":  10,
     "_reuse说明":  "同一链接在这段时间内复用已下载的文件：抽帧（/read）和搬进群（/parse）只下载一次。"

@@ -298,8 +298,12 @@ async function ytdlpDownload(url, outDir, { maxHeight = 720 } = {}) {
   const tpl = path.join(outDir, '%(id)s.%(ext)s')
   // 封顶高度：太大对"看内容"没意义，只会让下载和抽帧都变慢。
   // 看视频传 480（帧长边 1024 都够，还快一半），搬媒体传 720（群里看着要清楚）。
+  // ⚠️ 别用 `-f bv*[height<=N]+ba/b[height<=N]/b` 这种"硬过滤"：B 站有些稿件（竖屏/HEVC/只有高分辨率）
+  //    一个 height<=N 的格式都没有，整条表达式就直接 "Requested format is not available"，视频下不下来。
+  //    （2026-10-29 实测：BV18YxK6NEPy「一颗钻石里藏着多少光？」就是这么挂的）
+  //    改用 -S 排序：先挑最接近 maxHeight 的，挑不到就往下降，任何稿件都有得选。
   const r = await run(cmd, [
-    ...pre, '-f', `bv*[height<=${maxHeight}]+ba/b[height<=${maxHeight}]/b`,
+    ...pre, '-f', 'bv*+ba/b/best', '-S', `res:${maxHeight}`,
     '--merge-output-format', 'mp4', '--no-playlist', '--no-warnings',
     ...cookieArgs(),
     '-o', tpl, url,
@@ -314,6 +318,27 @@ async function ytdlpDownload(url, outDir, { maxHeight = 720 } = {}) {
   if (!mp4) return { ok: false, error: 'yt-dlp 没产出文件' }
   const st = await fsp.stat(mp4)
   return { ok: true, file: mp4, size: st.size }
+}
+
+/**
+ * 直接 HTTP 下载（QQ CDN 那种直链走这条）。
+ * yt-dlp 只适合它认识的平台；对 "xxx.cn/download?appid=..." 这种地址它会当成文件名，
+ * Windows 上 ? 非法 → Errno 22。直链就直接 fetch。
+ */
+async function directDownload(url, outDir) {
+  const dest = path.join(outDir, 'source.mp4')
+  await fsp.mkdir(outDir, { recursive: true })
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(CFG.taskTimeoutMs) })
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}（QQ 的直链通常带签名且会过期，可能已失效）` }
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (!buf.length) return { ok: false, error: '下载到 0 字节' }
+    if (buf.length > CFG.maxMb * 1048576) return { ok: false, error: `文件 ${mb(buf.length)}MB 超过上限 ${CFG.maxMb}MB` }
+    await fsp.writeFile(dest, buf)
+    return { ok: true, file: dest, size: buf.length }
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e).slice(0, 200) }
+  }
 }
 
 async function extractFrames(file, { frames, maxSide, outDir }) {
@@ -358,7 +383,11 @@ async function handleRead(body) {
   try {
     // ① 拿源文件
     let meta = { title: '', durationSec: 0, platform }
-    if (platform === 'file' || /^[A-Za-z]:[\\/]|^\//.test(url)) {
+    // ⚠️ 判据是 **URL 形态**，不是 platform 名字。
+    //    platform='file' 只表示"这是群友发的东西"，它可能是本地路径，也可能是 QQ CDN 直链
+    //    （multimedia.nt.qq.com.cn）—— 后者必须走网络分支，否则会被"本地路径白名单"拒掉。
+    const isHttp = /^https?:\/\//i.test(url)
+    if (!isHttp) {
       const chk = localAllowed(url)
       if (!chk.ok) return { ok: false, code: 'denied', error: chk.why }
       source = chk.real
@@ -381,14 +410,24 @@ async function handleRead(body) {
         source = hit.file
         log(`/read 复用 ${Math.round((nowMs() - hit.at) / 1000)} 秒前下载的文件（跳过重复下载）`)
       } else {
-        const m = await ytdlpMeta(url)
-        if (!m) return { ok: false, code: 'nomatch', error: 'yt-dlp 认不出这个链接' }
-        meta = m
-        if (meta.durationSec > CFG.maxSeconds) {
-          return { ok: false, code: 'too_long', error: `视频 ${Math.round(meta.durationSec)} 秒，超过上限 ${CFG.maxSeconds} 秒` }
+        // 分流：B站/抖音 → yt-dlp（它认识这些平台）；其它直链（QQ CDN 等）→ 直接 fetch。
+        // 之前一律走 yt-dlp，"multimedia.nt.qq.com.cn/download?appid=..." 会被当成文件名，
+        // Windows 上 ? 非法 → Errno 22。（踩过）
+        const isKnownPlatform = /bilibili\.com|b23\.tv|bili2233\.cn|douyin\.com|iesdouyin\.com/i.test(url)
+        let dl
+        if (isKnownPlatform) {
+          const m = await ytdlpMeta(url)
+          if (!m) return { ok: false, code: 'nomatch', error: 'yt-dlp 认不出这个链接' }
+          meta = m
+          if (meta.durationSec > CFG.maxSeconds) {
+            return { ok: false, code: 'too_long', error: `视频 ${Math.round(meta.durationSec)} 秒，超过上限 ${CFG.maxSeconds} 秒` }
+          }
+          await fsp.mkdir(dlDir, { recursive: true })
+          dl = await ytdlpDownload(url, dlDir, { maxHeight: 480 })
+        } else {
+          log('/read 直链下载（不走 yt-dlp）')
+          dl = await directDownload(url, dlDir)
         }
-        await fsp.mkdir(dlDir, { recursive: true })
-        const dl = await ytdlpDownload(url, dlDir, { maxHeight: 480 })
         if (!dl.ok) return { ok: false, code: 'download_failed', error: dl.error }
         if (dl.size > CFG.maxMb * 1048576) {
           return { ok: false, code: 'too_big', error: `文件 ${mb(dl.size)}MB 超过上限 ${CFG.maxMb}MB` }
